@@ -1,0 +1,341 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - uat
+      - prod
+  DynamoTableName:
+    Type: String
+    Default: pixel-streaming
+  InstanceThreshold:
+    Type: Number
+    Default: 2
+    Description: The number of 'warm' instances to maintain
+  IdleThreshold:
+    Type: Number
+    Default: 300
+    Description: The number of seconds an instance can remain idle before being terminated
+  AutoScalingGroupName:
+    Type: String
+    Default: pixel-streaming-asg
+  PixelStreamingAMIID:
+    Type: String
+    Description: The AMI ID of your Pixel Streaming image
+  InstanceType:
+    Type: String
+    Default: g4dn.xlarge
+Globals:
+  Api:
+    Cors: 
+      AllowMethods: "'GET,HEAD,POST,PUT,DELETE,OPTIONS,PATCH'"
+      AllowHeaders: "'*'"
+      AllowOrigin: "'*'"
+      AllowCredentials: "'true'"
+      MaxAge: "'600'"
+Resources:
+  APIGatewayAPI:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors: 
+        AllowMethods: "'GET,HEAD,POST,PUT,DELETE,OPTIONS,PATCH'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+        AllowCredentials: "'true'"
+        MaxAge: "'600'"
+      EndpointConfiguration: REGIONAL
+      MinimumCompressionSize: 1024
+      MethodSettings:
+        - DataTraceEnabled: True
+          #LoggingLevel: "INFO"
+          MetricsEnabled: True
+          HttpMethod: "*" #All methods
+          ResourcePath: "/*"
+          ThrottlingBurstLimit: 10000 #Capped at 10K requests per second across the whole API
+          ThrottlingRateLimit: 5000
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseTemplates: 
+            "application/json": '{ "message": $context.error.messageString }'
+
+  ASGHookLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler 
+      Runtime: python3.7 
+      CodeUri: deploy_asg_hook.zip 
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt PixelStreamingLambdaRole.Arn
+      Environment:
+        Variables:
+          AppS3Bucket: "sdfs"
+      Events:
+        ProxyResourcePreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref APIGatewayAPI
+            Path: "/{proxy+}"
+            Method: OPTIONS
+        ProxyResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref APIGatewayAPI
+            Path: "/{proxy+}"
+            Method: ANY
+        RootResourcePreflight:
+          Type: Api
+          Properties:
+            RestApiId: !Ref APIGatewayAPI
+            Path: "/"
+            Method: OPTIONS
+        RootResource:
+          Type: Api
+          Properties:
+            RestApiId: !Ref APIGatewayAPI
+            Path: "/"
+            Method: ANY
+
+
+  MakeAvailableLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler 
+      Runtime: python3.7 
+      CodeUri: deploy_make_available.zip 
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt PixelStreamingLambdaRole.Arn
+      Environment:
+        Variables:
+          AppS3Bucket: "asfda"
+      Events:
+        RootResourcePost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref APIGatewayAPI
+            Path: "/streaming"
+            Method: POST
+            #        RootResourcePreflight:
+            #          Type: Api
+            #          Properties:
+            #            RestApiId: !Ref APIGatewayAPI
+            #            Path: "/streaming"
+            #            Method: OPTIONS
+            #        RootResource:
+            #          Type: Api
+            #          Properties:
+            #            RestApiId: !Ref APIGatewayAPI
+            #            Path: "/streaming"
+            #            Method: ANY
+
+  GetStreamingLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: lambda_function.lambda_handler 
+      Runtime: python3.7 
+      CodeUri: deploy_get_streaming.zip 
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt PixelStreamingLambdaRole.Arn
+      Environment:
+        Variables:
+          AppS3Bucket: "sdfs"
+      Events:
+        RootResourcePost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref APIGatewayAPI
+            Path: "/streaming"
+            Method: GET
+            #        RootResourcePreflight:
+            #          Type: Api
+            #          Properties:
+            #            RestApiId: !Ref APIGatewayAPI
+            #            Path: "/streaming"
+            #            Method: OPTIONS
+            #        RootResource:
+            #          Type: Api
+            #          Properties:
+            #            RestApiId: !Ref APIGatewayAPI
+            #            Path: "/streaming"
+            #            Method: ANY
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: True
+      EnableDnsSupport: True
+      Tags:
+        - Key: Name
+          Value: pixel-streaming-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: pixel-streaming-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: 10.0.0.0/22
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pub-A-pixel-streaming
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: 10.0.4.0/22 
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pub-B-pixel-streaming
+  
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [ 2, !GetAZs  '' ]
+      CidrBlock: 10.0.8.0/22 
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pub-C-pixel-streaming
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: public-routes-pixel-streaming 
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetA
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetB
+
+  PublicSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetC
+
+  PixelStreamingTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: pixel-streaming-notifications
+
+      #  Lambda:
+      #    Type: AWS::Serverless::Lambda
+      #    Properties:
+      
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroupName
+      DesiredCapacity: !Ref InstanceThreshold
+      MinSize: !Ref InstanceThreshold
+      MaxSize: !Ref InstanceThreshold
+      NotificationConfiguration:
+        NotificationTypes: 
+          - autoscaling:EC2_INSTANCE_LAUNCH
+        TopicARN: !Ref PixelStreamingTopic
+      LaunchConfigurationName: PixelStreaming 
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+        - !Ref PublicSubnetC
+
+  PixelStreamingSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: pixel-streaming-sg
+      GroupDescription: pixel-streaming-sg
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+      VpcId: !Ref Vpc
+
+  AutoScalingLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      #AssociatePublicIPAddress: True
+      ImageId: !Ref PixelStreamingAMIID
+      LaunchConfigurationName: PixelStreaming
+      SecurityGroups: 
+        - !Ref PixelStreamingSG
+      InstanceType: !Ref InstanceType
+      #IamInstanceProfile
+
+  PixelStreamingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      MaxSessionDuration: 43200
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - autoscaling:DescribeAutoScalingGroups
+                  - ec2:DescribeInstances
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource: '*'
